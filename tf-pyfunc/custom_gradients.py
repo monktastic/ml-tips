@@ -1,0 +1,177 @@
+"""
+Suppose we build a Keras model like so:
+
+  Dense -> Lambda -> Dense
+
+And we want the Lambda to run arbitrary Python code. For this, we can use
+tf.py_func. However, for the model to train, it needs to backprop through
+the Lambda, which means we need to calculate a gradient (d_Cost/d_in) as well.
+Note that we can use a py_func in the gradient too.
+
+On backprop, TF gives us d_Cost/d_out for our layer. If we have d_out/d_in
+(the derivative of our layer), we can just multiply the two to get the gradient.
+
+In our example, the "arbitrary Python code" is itself a TF model (the "internal
+model"). This means that we can use tf.gradients to fetch its d_out/d_in Tensor
+instead of working it out ourselves. However, to evaluate that for a given input
+requires that we _have_ the input -- which we don't during backprop. The
+solution is to evaluate it on the _forward_ pass and stash it as an auxiliary
+output (which we are also given by TF on the backward pass).
+
+This idea can be extended so that a Lambda layer can call remote TF models, for
+example. Note that the internal model does not learn.
+
+We test it by expecting our overall model to compute the same function as the
+Lambda. This means our Dense layers should jointly learn the Identity function.
+"""
+
+from functools import partial
+
+import numpy as np
+import tensorflow as tf
+from keras import constraints
+from keras import losses
+from keras.layers.core import Lambda, Dense
+from keras.models import Sequential
+from keras.optimizers import Adam
+
+
+# Gross, but we need a Session for invoke_model to evaluate the gradient.
+sess = tf.Session()
+
+
+# With a little help from https://gist.github.com/harpone/3453185b41d8d985356cbe5e57d67342#gistcomment-2070556
+
+# Define custom py_func which takes also a grad op as argument:
+def get_py_func(fn, grad_fn):
+    def py_func(x):
+        # Need to generate a unique name to avoid duplicates:
+        rnd_name = 'PyFuncGrad' + str(np.random.randint(0, 1E+8))
+
+        tf.RegisterGradient(rnd_name)(grad_fn)
+        g = tf.get_default_graph()
+        # See https://stackoverflow.com/questions/41391718/tensorflows-gradient-override-map-function
+        # The c++ op is called PyFunc. Here we're overriding its gradient function
+        # with the one we registered above, under the name rnd_name. We also
+        # override PyFuncStateless in case stateful=False.
+        with g.gradient_override_map({"PyFunc": rnd_name,
+                                      "PyFuncStateless": rnd_name}):
+            # Two outputs: the actual output and its derivative.
+            y, grad = tf.py_func(fn, [x], [tf.float32, tf.float32], stateful=False)
+            y.set_shape(x.get_shape())
+            return y
+    return py_func
+
+
+# Do the forward pass on the internal model. Return the gradient so that it can
+# be used in the backward pass.
+def invoke_model(x, model, grads):
+    y = model.predict(x)
+    grad_val = grads[0].eval(session=sess, feed_dict={model.input: x})
+    return y, grad_val
+
+
+# Calculates dC/din as dC/dout * dout/din. See calc_grad for usage.
+def grad_pyfunc(dC_dout, dout_din):
+    return dC_dout * dout_din
+
+
+# Custom gradient function. Requires that the forward pass stashed its derivative
+# (dout/din) in outputs[1]. TF gives us dC/dout0. This allows us to calculate
+#   dC/din = dC/dout0 * dout0/din
+# Though we could just return that directly here, we opt to invoke a py_func,
+# just to demonstrate how to invoke arbitrary Python code.
+def calc_grad(op, dC_dout0, dC_dout1):
+    # return dC_dout0 * op.outputs[1]
+
+    return tf.py_func(grad_pyfunc, [dC_dout0, op.outputs[1]], tf.float32)
+
+
+# A simple function that our internal model will calculate. Factored out so that
+# our test data generator can call it too.
+def internal_model_func(x):
+    return 2 * x + [50, 100]
+
+
+# Generator to use with fit_generator.
+def gen():
+    while True:
+        x = np.random.random_integers(0, 100, size=2).reshape((2,)).astype(np.float32)
+        y = internal_model_func(x)
+        # Add batch dimension.
+        yield ([np.expand_dims(x, 0)], [np.expand_dims(y, 0)])
+
+
+def get_internal_model():
+    internal_model = Sequential()
+    internal_model.add(Lambda(internal_model_func, name='internal-lambda', input_shape=(2,)))
+    return internal_model
+
+
+def get_outer_model(internal_func):
+    # This is our outer model. It's just:
+    #
+    #   Dense with no bias -> internal_model -> dense with no bias
+    #
+    # The idea is for the dense layers to learn the identity function,
+    # and let internal_model do all the work (notice how the data generator
+    # computes the same function as internal_model).
+    model = Sequential()
+    model.add(Dense(
+        2,
+        bias_constraint=constraints.MaxNorm(0),
+        kernel_constraint=constraints.NonNeg(),
+        input_shape=(2,)))
+
+    # Lambda that wraps a function (internal_func) that's generated by calling
+    # get_py_func, which returns a function (py_func) that invokes tf.py_func
+    # on the given function (which invokes the inner model).
+    model.add(Lambda(internal_func))
+
+    model.add(Dense(
+        2,
+        bias_constraint=constraints.MaxNorm(0),
+        kernel_constraint=constraints.NonNeg()))
+
+    return model
+
+if __name__ == "__main__":
+    internal_model = get_internal_model()
+
+    # Somehow, calling predict() here prevents the following error when
+    # invoke_model calls predict():
+    #  Tensor Tensor("internal-lambda/add:0", shape=(?, 2), dtype=float32) is not an element of this graph.
+    # I'm sure there's a better way of fixing this.
+    x = np.array([[20, 100]], dtype=np.float32)
+    pred = internal_model.predict(x)
+
+    # Get a version of invoke_model that uses our model and its internal gradients.
+    grads = tf.gradients(internal_model.outputs, internal_model.inputs)
+    invoke_internal_model = partial(invoke_model, model=internal_model, grads=grads)
+    # Construct the py_func.
+    py_func = get_py_func(invoke_internal_model, calc_grad)
+
+    # Create the local model.
+    model = get_outer_model(py_func)
+
+    # Train the local model, ensuring backprop through internal model works.
+    model.compile(
+        optimizer=Adam(lr=0.1, decay=0.03),
+        loss=losses.mean_absolute_error
+    )
+    model.fit_generator(
+        gen(),
+        steps_per_epoch=1000,
+        epochs=12
+    )
+
+    # The learned kernels should multiply out to Identity.
+    k1 = model.layers[0].get_weights()[0]
+    k2 = model.layers[2].get_weights()[0]
+    k_prod = np.dot(k1, k2)
+
+    print(k_prod)
+
+    dist = np.linalg.norm(k_prod - np.eye(2, 2))
+    print("Distance to Identity matrix:", dist)
+
